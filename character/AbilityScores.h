@@ -12,6 +12,7 @@ struct AbilityScores {
     int MOVE  = 0;  // Скорость
     int BODY  = 0;  // Телосложение
     int EMP   = 0;  // Эмпатия
+    int HP   = 0;  // Здоровье
 
     void print() const {
         std::cout << "ИНТ:  " << INT_  << "\n";
