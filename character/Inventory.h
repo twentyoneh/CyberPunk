@@ -7,6 +7,7 @@
 #include <vector>
 #include <map>
 #include <iostream>
+#include <algorithm> // std::min (используется в reload())
 
 struct Inventory {
     std::vector<Weapon>         weapons;

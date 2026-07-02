@@ -147,7 +147,15 @@ const AbilityScores RoleStats::TABLE[static_cast<int>(Role::COUNT)][10] = {
 };
 
 AbilityScores RoleStats::roll(Role role, int d10) {
-    return TABLE[static_cast<int>(role)][d10];
+    // d10 приходит как результат броска кубика в диапазоне 1..10 (см. main.cpp:
+    // rand() % 10 + 1), а строки таблицы индексируются с 0. Без "-1" бросок 10
+    // читал бы память ЗА пределами массива (там всего 10 строк, индексы 0..9) —
+    // неопределённое поведение, а бросок 1 попадал бы во вторую строку вместо первой.
+    int index = d10 - 1;
+    if (index < 0) index = 0;
+    if (index > 9) index = 9;
+
+    return TABLE[static_cast<int>(role)][index];
 }
 
 std::string RoleStats::roleName(Role role) {

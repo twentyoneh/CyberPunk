@@ -8,17 +8,23 @@
 #include "./world/GridMath.h"
 #include "./world/TestMaps.h"
 #include "./world/NpcRoster.h"
+#include "./world/EnemyRoster.h"
 #include "./render/TileAtlas.h"
 #include "./render/TileRender.h"
 #include "./render/Fonts.h"
 #include "./render/DialogueBox.h"
+#include "./render/BattleRender.h"
 #include "./game/TurnManager.h"
 #include "./game/Npc.h"
 #include "./game/NpcManager.h"
+#include "./game/Enemy.h"
+#include "./game/EnemyManager.h"
 #include "./game/Dialogue.h"
+#include "./combat/Battle.h"
 #include <iostream>
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 
 // =====================================================================================
 // ОБЩАЯ ЛОГИКА ПРОГРАММЫ
@@ -122,12 +128,30 @@ int main(void)
     // правится только NpcRoster.h, здесь ничего менять не нужно.
     NpcManager npcManager(NpcRoster::NeonAlleyNpcs());
 
+    // Враги сцены живут в EnemyManager — тот же приём, что и NpcManager выше,
+    // только вместо реплик у каждого врага полноценный Character (статы/
+    // навыки/инвентарь, см. src/game/Enemy.h), которым пользуется Battle.
+    EnemyManager enemyManager(EnemyRoster::NeonAlleyEnemies());
+
     Dialogue dialogue; // текущее состояние разговора: открыт ли, с кем, какая реплика
+
+    // Переключение сцен: пока сцен всего две — исследование карты сверху и
+    // отдельная боевая арена (см. Battle.h). battle заполняется только на
+    // время боя (см. запуск ниже) и очищается после его окончания.
+    enum class Scene { Exploration, BattleScene };
+    Scene scene = Scene::Exploration;
+    std::optional<Battle> battle;
 
     // Шрифт с поддержкой кириллицы для HUD — встроенный шрифт raylib (тот, которым
     // рисует обычный DrawText) кириллицу не содержит вообще, поэтому русский текст
     // ниже рисуется через DrawTextEx этим шрифтом, а не через DrawText.
-    Font uiFont = Fonts::LoadCyrillicFont("Fonts/ofont.ru_Hemico.ttf", 10);
+    //
+    // ofont.ru_Hemico.ttf (декоративный, ближе к рукописному) на 10px читался плохо —
+    // заменили на DejaVu Sans Mono: моноширинный, с полной поддержкой кириллицы,
+    // спроектирован специально ради разборчивости на мелких размерах (используется
+    // почти во всех терминалах/IDE) — и моноширинность неплохо ложится на общий
+    // "терминальный" вайб Cyberpunk RED.
+    Font uiFont = Fonts::LoadCyrillicFont("Fonts/DejaVuSansMono.ttf", 10);
 
     // Позиция игрока в клетках сетки (не в пикселях!). Экранные координаты
     // считаются из неё каждый кадр через World::GridToScreen.
@@ -152,7 +176,50 @@ int main(void)
         // всех NPC — здесь неважно, один их или десять.
         const Npc* interactableNpc = npcManager.FindInteractable(playerGX, playerGY);
 
-        if (dialogue.IsOpen())
+        if (scene == Scene::BattleScene)
+        {
+            // Пока бой не закончен — ввод идёт в Battle (движение по арене
+            // клавишами, атака по Space/Enter), а сама Battle раз в кадр
+            // продвигает ИИ противника (см. Battle::Update).
+            if (battle->GetOutcome() == Battle::Outcome::Ongoing)
+            {
+                if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D)) battle->TryMovePlayer(1, 0);
+                else if (IsKeyPressed(KEY_LEFT)  || IsKeyPressed(KEY_A)) battle->TryMovePlayer(-1, 0);
+                else if (IsKeyPressed(KEY_DOWN)  || IsKeyPressed(KEY_S)) battle->TryMovePlayer(0, 1);
+                else if (IsKeyPressed(KEY_UP)    || IsKeyPressed(KEY_W)) battle->TryMovePlayer(0, -1);
+                else if (IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ENTER)) battle->TryPlayerAttack();
+
+                battle->Update(GetFrameTime());
+            }
+            else
+            {
+                // Бой закончен (победа/поражение) — ждём подтверждения, чтобы
+                // игрок успел прочитать лог боя, прежде чем вернуться на карту.
+                if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE))
+                {
+                    if (battle->GetOutcome() == Battle::Outcome::Victory)
+                    {
+                        // Победа — помечаем вовлечённых врагов побеждёнными в
+                        // EnemyManager, чтобы они пропали с карты исследования.
+                        battle->MarkDefeatedEnemies();
+                    }
+                    else
+                    {
+                        // Поражение — отдельной сцены game over пока нет,
+                        // поэтому временная заглушка: игрок полностью лечится
+                        // и возвращается на стартовую клетку карты. Когда
+                        // появится нормальный game over/чекпоинты — заменить.
+                        character.heal(character.getMaxHP());
+                        playerGX = 1;
+                        playerGY = 1;
+                    }
+
+                    battle.reset();
+                    scene = Scene::Exploration;
+                }
+            }
+        }
+        else if (dialogue.IsOpen())
         {
             // Пока идёт диалог, обычное управление отключено полностью —
             // доступны только "дальше реплика" и "закрыть раньше времени".
@@ -188,7 +255,16 @@ int main(void)
                 // стена — иначе игрок прошёл бы прямо сквозь него.
                 bool blockedByNpc = npcManager.IsOccupied(newX, newY);
 
-                if (grid.IsWalkable(newX, newY) && !blockedByNpc)
+                // А клетка, занятая ЖИВЫМ врагом, вместо блокировки запускает
+                // бой — "бой начинается, если толкнуться во врага" (см. задачу).
+                int engageEnemyIdx = enemyManager.FindIndexAt(newX, newY);
+
+                if (engageEnemyIdx != -1)
+                {
+                    battle.emplace(character, enemyManager, std::vector<int>{ engageEnemyIdx });
+                    scene = Scene::BattleScene;
+                }
+                else if (grid.IsWalkable(newX, newY) && !blockedByNpc)
                 {
                     playerGX = newX;
                     playerGY = newY;
@@ -214,91 +290,131 @@ int main(void)
         // Draw (в низкое разрешение)
         //----------------------------------------------------------------------------------
         BeginTextureMode(target); // всё между Begin/End рисуется в target, а не в окно
-            ClearBackground(Color{ 12, 12, 20, 255 });
-
-            // --- "Камера" сверху -----------------------------------------------------
-            // Настоящей камеры нет: считаем, где на экране был бы центр клетки игрока
-            // при нулевом смещении, и сдвигаем origin так, чтобы эта точка совпала
-            // с центром экрана. В результате мир визуально "едет" под игроком.
-            Vector2 playerTopLeft = World::GridToScreen(playerGX, playerGY, Vector2{ 0, 0 });
-            Vector2 playerCenter  = {
-                playerTopLeft.x + World::TILE_SIZE / 2.0f,
-                playerTopLeft.y + World::TILE_SIZE / 2.0f
-            };
-            Vector2 origin = {
-                RENDER_WIDTH  / 2.0f - playerCenter.x,
-                RENDER_HEIGHT / 2.0f - playerCenter.y
-            };
-
-            // --- Отрисовка тайлов -----------------------------------------------------
-            for (int y = 0; y < grid.GetHeight(); y++)
+            if (scene == Scene::BattleScene)
             {
-                for (int x = 0; x < grid.GetWidth(); x++)
+                // --- Боевая сцена -------------------------------------------------
+                ClearBackground(Color{ 8, 8, 14, 255 });
+
+                BattleRender::Draw(*battle, uiFont, RENDER_WIDTH, RENDER_HEIGHT);
+
+                if (battle->GetOutcome() != Battle::Outcome::Ongoing)
                 {
-                    Vector2 topLeft = World::GridToScreen(x, y, origin);
-
-                    if (grid.IsWalkable(x, y))
-                        TileRender::DrawFloor(topLeft, atlas.GetFloorTexture(x, y));
-                    else
-                        TileRender::DrawWall(topLeft, atlas.GetWallTexture());
+                    const char* resultText = (battle->GetOutcome() == Battle::Outcome::Victory)
+                        ? "ПОБЕДА! Enter/Space - продолжить"
+                        : "ПОРАЖЕНИЕ... Enter/Space - продолжить";
+                    Vector2 textSize = MeasureTextEx(uiFont, resultText, 12, 1);
+                    DrawTextEx(uiFont, resultText,
+                        Vector2{ RENDER_WIDTH / 2.0f - textSize.x / 2.0f, RENDER_HEIGHT / 2.0f - 30 },
+                        12, 1, GOLD);
                 }
-            }
-
-            // --- NPC --------------------------------------------------------------
-            // Один цикл рисует всех NPC разом — сколько бы их ни было в
-            // NpcRoster.h, этот код не меняется. Рисуются до игрока (проще всего
-            // считать, что NPC всегда "дальше" на этой маленькой сцене). Когда
-            // актёров станет много, стоит сортировать по возрастанию gy, чтобы
-            // те, кто ниже на экране, перекрывали тех, кто выше.
-            for (const Npc& npc : npcManager.All())
-            {
-                Vector2 npcScreenTopLeft = World::GridToScreen(npc.gx, npc.gy, origin);
-                Vector2 npcFeetPos = {
-                    npcScreenTopLeft.x + World::TILE_SIZE / 2.0f,
-                    npcScreenTopLeft.y + World::TILE_SIZE
-                };
-                // NPC использует ту же текстуру, что и игрок (в resources пока
-                // только один спрайт персонажа) — розоватый tint нужен просто
-                // чтобы отличать их на глаз. Кадр всегда "стойка лицом на юг".
-                Rectangle npcFrameRect = atlas.GetPlayerFrameRect(FACING_SOUTH, 0);
-                TileRender::DrawPlayer(npcFeetPos, atlas.GetPlayerTexture(), npcFrameRect, Color{ 255, 170, 210, 255 });
-
-                // Иконка "можно поговорить" — только над тем NPC, к которому
-                // игрок реально стоит вплотную, и только пока диалог не открыт.
-                if (&npc == interactableNpc && !dialogue.IsOpen())
-                {
-                    Vector2 hintPos = { npcFeetPos.x, npcFeetPos.y - 48 };
-                    TileRender::DrawInteractHint(hintPos, atlas.GetSpeechBubbleTexture());
-                }
-            }
-
-            // --- Игрок ------------------------------------------------------------
-            Rectangle frameRect = atlas.GetPlayerFrameRect(playerFacing, playerFrame);
-            Vector2 playerScreenTopLeft = World::GridToScreen(playerGX, playerGY, origin);
-            Vector2 feetPos = {
-                playerScreenTopLeft.x + World::TILE_SIZE / 2.0f,
-                playerScreenTopLeft.y + World::TILE_SIZE
-            };
-            TileRender::DrawPlayer(feetPos, atlas.GetPlayerTexture(), frameRect);
-
-            // HUD рисуется поверх сцены последним, прямо в той же низкоразрешённой текстуре.
-            // DrawTextEx + uiFont вместо DrawText — см. пояснение у объявления uiFont выше.
-            DrawTextEx(uiFont, TextFormat("Ход: %d", turnManager.GetTurnNumber()), Vector2{ 6, 6 }, 10, 1, RAYWHITE);
-
-            if (dialogue.IsOpen())
-            {
-                // Само окно диалога перекрывает нижнюю подсказку по управлению —
-                // в этот момент она не нужна, место занято текстом реплики.
-                DialogueBox::Draw(dialogue, uiFont, RENDER_WIDTH, RENDER_HEIGHT);
             }
             else
             {
-                // Контекстная подсказка снизу: рядом с NPC — как заговорить,
-                // иначе — обычное напоминание про управление.
-                const char* bottomHint = interactableNpc
-                    ? "E - поговорить"
-                    : "WASD / стрелки - движение по тайлам";
-                DrawTextEx(uiFont, bottomHint, Vector2{ 6, RENDER_HEIGHT - 16 }, 10, 1, Fade(RAYWHITE, 0.7f));
+                // --- Сцена исследования --------------------------------------------
+                ClearBackground(Color{ 12, 12, 20, 255 });
+
+                // --- "Камера" сверху -----------------------------------------------------
+                // Настоящей камеры нет: считаем, где на экране был бы центр клетки игрока
+                // при нулевом смещении, и сдвигаем origin так, чтобы эта точка совпала
+                // с центром экрана. В результате мир визуально "едет" под игроком.
+                Vector2 playerTopLeft = World::GridToScreen(playerGX, playerGY, Vector2{ 0, 0 });
+                Vector2 playerCenter  = {
+                    playerTopLeft.x + World::TILE_SIZE / 2.0f,
+                    playerTopLeft.y + World::TILE_SIZE / 2.0f
+                };
+                Vector2 origin = {
+                    RENDER_WIDTH  / 2.0f - playerCenter.x,
+                    RENDER_HEIGHT / 2.0f - playerCenter.y
+                };
+
+                // --- Отрисовка тайлов -----------------------------------------------------
+                for (int y = 0; y < grid.GetHeight(); y++)
+                {
+                    for (int x = 0; x < grid.GetWidth(); x++)
+                    {
+                        Vector2 topLeft = World::GridToScreen(x, y, origin);
+
+                        if (grid.IsWalkable(x, y))
+                            TileRender::DrawFloor(topLeft, atlas.GetFloorTexture(x, y));
+                        else
+                            TileRender::DrawWall(topLeft, atlas.GetWallTexture());
+                    }
+                }
+
+                // --- NPC --------------------------------------------------------------
+                // Один цикл рисует всех NPC разом — сколько бы их ни было в
+                // NpcRoster.h, этот код не меняется. Рисуются до игрока (проще всего
+                // считать, что NPC всегда "дальше" на этой маленькой сцене). Когда
+                // актёров станет много, стоит сортировать по возрастанию gy, чтобы
+                // те, кто ниже на экране, перекрывали тех, кто выше.
+                for (const Npc& npc : npcManager.All())
+                {
+                    Vector2 npcScreenTopLeft = World::GridToScreen(npc.gx, npc.gy, origin);
+                    Vector2 npcFeetPos = {
+                        npcScreenTopLeft.x + World::TILE_SIZE / 2.0f,
+                        npcScreenTopLeft.y + World::TILE_SIZE
+                    };
+                    // NPC использует ту же текстуру, что и игрок (в resources пока
+                    // только один спрайт персонажа) — розоватый tint нужен просто
+                    // чтобы отличать их на глаз. Кадр всегда "стойка лицом на юг".
+                    Rectangle npcFrameRect = atlas.GetPlayerFrameRect(FACING_SOUTH, 0);
+                    TileRender::DrawPlayer(npcFeetPos, atlas.GetPlayerTexture(), npcFrameRect, Color{ 255, 170, 210, 255 });
+
+                    // Иконка "можно поговорить" — только над тем NPC, к которому
+                    // игрок реально стоит вплотную, и только пока диалог не открыт.
+                    if (&npc == interactableNpc && !dialogue.IsOpen())
+                    {
+                        Vector2 hintPos = { npcFeetPos.x, npcFeetPos.y - 48 };
+                        TileRender::DrawInteractHint(hintPos, atlas.GetSpeechBubbleTexture());
+                    }
+                }
+
+                // --- Враги --------------------------------------------------------------
+                // Побеждённые (Enemy::defeated) больше не рисуются — исчезают с
+                // карты насовсем, как и было решено в EnemyManager. Пока рисуются
+                // тем же спрайтом игрока с красноватым тоном — отдельного арта
+                // для врагов в resources ещё нет.
+                for (const Enemy& enemy : enemyManager.All())
+                {
+                    if (enemy.defeated) continue;
+
+                    Vector2 enemyScreenTopLeft = World::GridToScreen(enemy.gx, enemy.gy, origin);
+                    Vector2 enemyFeetPos = {
+                        enemyScreenTopLeft.x + World::TILE_SIZE / 2.0f,
+                        enemyScreenTopLeft.y + World::TILE_SIZE
+                    };
+                    Rectangle enemyFrameRect = atlas.GetPlayerFrameRect(FACING_SOUTH, 0);
+                    TileRender::DrawPlayer(enemyFeetPos, atlas.GetPlayerTexture(), enemyFrameRect, Color{ 233, 69, 96, 255 });
+                }
+
+                // --- Игрок ------------------------------------------------------------
+                Rectangle frameRect = atlas.GetPlayerFrameRect(playerFacing, playerFrame);
+                Vector2 playerScreenTopLeft = World::GridToScreen(playerGX, playerGY, origin);
+                Vector2 feetPos = {
+                    playerScreenTopLeft.x + World::TILE_SIZE / 2.0f,
+                    playerScreenTopLeft.y + World::TILE_SIZE
+                };
+                TileRender::DrawPlayer(feetPos, atlas.GetPlayerTexture(), frameRect);
+
+                // HUD рисуется поверх сцены последним, прямо в той же низкоразрешённой текстуре.
+                // DrawTextEx + uiFont вместо DrawText — см. пояснение у объявления uiFont выше.
+                DrawTextEx(uiFont, TextFormat("Ход: %d", turnManager.GetTurnNumber()), Vector2{ 6, 6 }, 10, 1, RAYWHITE);
+
+                if (dialogue.IsOpen())
+                {
+                    // Само окно диалога перекрывает нижнюю подсказку по управлению —
+                    // в этот момент она не нужна, место занято текстом реплики.
+                    DialogueBox::Draw(dialogue, uiFont, RENDER_WIDTH, RENDER_HEIGHT);
+                }
+                else
+                {
+                    // Контекстная подсказка снизу: рядом с NPC — как заговорить,
+                    // иначе — обычное напоминание про управление.
+                    const char* bottomHint = interactableNpc
+                        ? "E - поговорить"
+                        : "WASD / стрелки - движение по тайлам";
+                    DrawTextEx(uiFont, bottomHint, Vector2{ 6, RENDER_HEIGHT - 16 }, 10, 1, Fade(RAYWHITE, 0.7f));
+                }
             }
         EndTextureMode();
         //----------------------------------------------------------------------------------
@@ -324,3 +440,7 @@ int main(void)
 
     return 0;
 }
+
+
+
+
